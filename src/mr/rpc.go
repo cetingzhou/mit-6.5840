@@ -12,16 +12,17 @@ import (
 )
 
 type Heartbeat struct {
-	State    string
-	TaskType string
-	TaskId   int
+	TaskState string
+	TaskType  string
+	TaskId    int
 }
 
 type HeartbeatReply struct {
 	FileLocation string
 	TaskType     string
 	TaskId       int
-	NReduce      int
+	NTask        int
+	Done         bool
 }
 
 // Add your RPC definitions here.

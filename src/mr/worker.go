@@ -8,13 +8,30 @@ import (
 	"log"
 	"net/rpc"
 	"os"
+	"sort"
+	"strings"
 	"sync"
+	"time"
 )
 
 // Map functions return a slice of KeyValue.
 type KeyValue struct {
 	Key   string
 	Value string
+}
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
+type WorkerState struct {
+	state     string
+	heartbeat *Heartbeat
+	mu        *sync.Mutex
 }
 
 // use ihash(key) % NReduce to choose the reduce
@@ -25,12 +42,65 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
+// worker should report heartbeat to coordinator every second to report its state
+// if worker is idle, it should be assigned a task.
+
+// when worker complete a task, it also should send a request to coordinator tell it
+// the assigned task has been completed.
+
 // main/mrworker.go calls this function.
 func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
-	request := Heartbeat{State: "idle"}
-	reply := HeartbeatReply{}
-	CallHeartbeat(&request, &reply)
+	log.Println("start worker")
+	var wmu sync.Mutex
+	workerState := &WorkerState{
+		state:     "idle",
+		heartbeat: &Heartbeat{},
+		mu:        &wmu,
+	}
+	heartbeatChan := make(chan *HeartbeatReply)
+	done := make(chan bool)
+	go func() {
+		log.Println("start worker heartbeat ticker")
+		ticker := time.NewTicker(1 * time.Second)
+		for {
+			select {
+			case <-ticker.C:
+				workerState.mu.Lock()
+				if workerState.state == "idle" {
+					log.Println("worker is idle and start to request task")
+					request := workerState.heartbeat
+					reply := &HeartbeatReply{}
+					CallHeartbeat(request, reply)
+					log.Printf("assigned task: %v\n", *reply)
+					heartbeatChan <- reply
+				}
+				workerState.mu.Unlock()
+			case <-done:
+				ticker.Stop()
+				return
+			}
+		}
+	}()
+	for {
+		reply := <-heartbeatChan
+		if reply.Done {
+			done <- true
+			return
+		} else if reply.TaskId != -1 {
+			log.Println("start to handle a task")
+			HandleHeartbeatReply(workerState, mapf, reducef, reply)
+			workerState.heartbeat.TaskId = reply.TaskId
+			workerState.heartbeat.TaskState = "completed"
+			workerState.heartbeat.TaskType = reply.TaskType
+			log.Println("finish a task")
+		}
+	}
+}
 
+func HandleHeartbeatReply(workerState *WorkerState, mapf func(string, string) []KeyValue, reducef func(string, []string) string, reply *HeartbeatReply) {
+	workerState.mu.Lock()
+	workerState.state = "inProgress"
+	workerState.mu.Unlock()
 	switch taskType := reply.TaskType; taskType {
 	case "map":
 		// call map function and save the output into nReduce intermediate files with file
@@ -47,9 +117,9 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 		}
 		file.Close()
 		kvs := mapf(filePath, string(content))
-		partitions := make([][]KeyValue, reply.NReduce)
+		partitions := make([][]KeyValue, reply.NTask)
 		for _, kv := range kvs {
-			i := ihash(kv.Key) % reply.NReduce
+			i := ihash(kv.Key) % reply.NTask
 			partitions[i] = append(partitions[i], kv)
 		}
 		var done sync.WaitGroup
@@ -73,22 +143,72 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 				if err != nil {
 					log.Fatalf("Failed to rename map temp file: %v", err)
 				}
-				tempFile.Close()
+				defer tempFile.Close()
 			}(i, p)
 		}
 		done.Wait()
-		// worker needs to signify coordinator that it has finished the task
-		signal := Heartbeat{"completed", "map", request.TaskId}
-		signalReply := HeartbeatReply{}
-		CallHeartbeat(&signal, &signalReply)
 	case "reduce":
+		// call reduce function to reduce all mapped files and write the output to a file
+		// with naming convention mr-out-R
+		fileLocations := strings.Split(reply.FileLocation, ",")
+		kvs := []KeyValue{}
+		var done sync.WaitGroup
+		var mu sync.Mutex
+		for _, f := range fileLocations {
+			done.Add(1)
+			go func(f string) {
+				defer done.Done()
+				file, err := os.Open(f)
+				if err != nil {
+					log.Fatalf("failed to open file: %v", err)
+				}
+				dec := json.NewDecoder(file)
+				for {
+					var kv KeyValue
+					if err := dec.Decode(&kv); err != nil {
+						break
+					}
+					mu.Lock()
+					kvs = append(kvs, kv)
+					mu.Unlock()
+				}
+				defer file.Close()
+			}(f)
+		}
+		done.Wait()
+		sort.Sort(ByKey(kvs))
+
+		// write out final output
+		oname := fmt.Sprintf("mr-out-%d", reply.TaskId)
+		ofile, _ := os.Create(oname)
+		i := 0
+		for i < len(kvs) {
+			j := i + 1
+			for j < len(kvs) && kvs[j].Key == kvs[i].Key {
+				j++
+			}
+			values := []string{}
+			for k := i; k < j; k++ {
+				values = append(values, kvs[k].Value)
+			}
+			output := reducef(kvs[i].Key, values)
+
+			// this is the correct format for each line of Reduce output.
+			fmt.Fprintf(ofile, "%v %v\n", kvs[i].Key, output)
+
+			i = j
+		}
+		defer ofile.Close()
 	default:
 		log.Fatalf("Invalid task type %s, which must be map or reduce.", taskType)
 	}
+	workerState.mu.Lock()
+	workerState.state = "idle"
+	workerState.mu.Unlock()
 }
 
 func CallHeartbeat(heartbeat *Heartbeat, heartbeatReply *HeartbeatReply) {
-	err := call("Coordinator.HeartbeatHandler", &heartbeat, &heartbeatReply)
+	err := call("Coordinator.HeartbeatHandler", heartbeat, heartbeatReply)
 	if err != nil {
 		log.Fatalf("Failed to send RPC request: %v", err)
 	}
