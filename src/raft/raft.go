@@ -28,7 +28,6 @@ import (
 	"6.5840/labrpc"
 )
 
-
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
@@ -61,7 +60,34 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	PersistentState
 
+	// Volatile state on all servers
+	// index of highest log entry known to be committed (initialized to 0, increases monotonically
+	commitIndex int
+	// index of highest log entry applied to state machine (initialized to 0, increases monotonically)
+	lastApplied int
+
+	// Volatile state on leaders
+	// for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
+	nextIndex []int
+	// for each server, index of highest log entry known to be replicated on server (initialized to 0, i
+	// ncreases monotonically)
+	matchIndex []int
+}
+
+type PersistentState struct {
+	// latest term server has seen (initialized to 0 on first boot,  increases monotonically)
+	CurrentTerm int
+	// candidateId that received vote in current term (or null if none)
+	VotedFor int
+	// log entries; each entry contains command for state machine, and term when entry was received by leader
+	LogEntries []*entry
+}
+
+type entry struct {
+	command interface{} // command for state machine
+	term    int         // term when entry was received by leader
 }
 
 // return currentTerm and whether this server
@@ -92,7 +118,6 @@ func (rf *Raft) persist() {
 	// rf.persister.Save(raftstate, nil)
 }
 
-
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
@@ -113,7 +138,6 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
 // the service says it has created a snapshot that has
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
@@ -123,22 +147,45 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term         int // candidate's term
+	CandidateId  int // candidate requesting vote
+	LastLogIndex int // index of candidate’s last log entry
+	LastLogTerm  int // term of candidate’s last log entry
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int  // currentTerm, for candidate to update itself
+	VoteGranted bool // true means candidate received vote
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+}
+
+type ApplyEnriesArgs struct {
+	Term              int      // leader's term
+	LeaderId          int      // so follower can redirect clients
+	PrevLogIndex      int      // index of log entry immediately preceding new ones
+	PrevLogTerm       int      // term of prevLogIndex entry
+	Entries           []*entry // log entries to store (empty for heartbeat; may send more than one for efficiency)
+	LeaderCommitIndex int      // leader's commitIndex
+}
+
+type ApplyEntriesReply struct {
+	Term    int  // currentTerm, for leader to update itself
+	Success bool // true if follower contained entry matching prevLogIndex and prevLogTerm
+}
+
+func (rf *Raft) ApplyEntries(args *ApplyEnriesArgs, reply *ApplyEntriesReply) {
+
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -173,7 +220,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -192,7 +238,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
 
 	return index, term, isLeader
 }
@@ -221,7 +266,6 @@ func (rf *Raft) ticker() {
 
 		// Your code here (2A)
 		// Check if a leader election should be started.
-
 
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
@@ -253,7 +297,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-
 
 	return rf
 }
