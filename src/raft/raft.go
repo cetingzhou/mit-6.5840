@@ -171,15 +171,17 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	if args.Term < rf.CurrentTerm.Load() {
+	// 1. Candidate should have higher term
+	// 2. Each term can only vote for one candidate
+	if args.Term < rf.CurrentTerm.Load() || (args.Term == rf.CurrentTerm.Load() && args.CandidateId != rf.VotedFor.Load()) {
 		reply.VoteGranted = false
-		reply.Term = rf.CurrentTerm.Load()
 	} else {
 		reply.VoteGranted = true
 		rf.VotedFor.Store(args.CandidateId)
 		rf.CurrentTerm.Store(args.Term)
 		rf.isLeader.Store(false)
 	}
+	reply.Term = rf.CurrentTerm.Load()
 }
 
 type AppendEnriesArgs struct {
