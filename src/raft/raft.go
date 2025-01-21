@@ -29,6 +29,12 @@ import (
 	"6.5840/labrpc"
 )
 
+const (
+	Leader    = "leader"
+	Follower  = "follower"
+	Candidate = "candidate"
+)
+
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
@@ -76,7 +82,7 @@ type Raft struct {
 	// ncreases monotonically)
 	matchIndex []int64
 
-	isLeader atomic.Bool
+	state atomic.Value
 
 	electionTimeout time.Duration
 	lastHeard       time.Time
@@ -100,7 +106,7 @@ type Entry struct {
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 	// Your code here (2A).
-	return int(rf.CurrentTerm.Load()), rf.isLeader.Load()
+	return int(rf.CurrentTerm.Load()), rf.state.Load() == Leader
 }
 
 // save Raft's persistent state to stable storage,
@@ -179,7 +185,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 		rf.VotedFor.Store(args.CandidateId)
 		rf.CurrentTerm.Store(args.Term)
-		rf.isLeader.Store(false)
+		rf.state.Store(Follower)
 	}
 	reply.Term = rf.CurrentTerm.Load()
 }
@@ -219,7 +225,7 @@ func (rf *Raft) resetElectionTimeout() {
 func (rf *Raft) shouldStartElection() bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return !rf.isLeader.Load() && time.Since(rf.lastHeard) > rf.electionTimeout
+	return rf.state.Load() != Leader && time.Since(rf.lastHeard) > rf.electionTimeout
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -300,6 +306,7 @@ func (rf *Raft) ticker() {
 		// Your code here (2A)
 		// Check if a leader election should be started.
 		if rf.shouldStartElection() {
+			rf.state.Store(Candidate)
 			rf.CurrentTerm.Add(1)
 			fmt.Printf("peer %d starts an election for term %d...\n", rf.me, rf.CurrentTerm.Load())
 
@@ -342,7 +349,7 @@ func (rf *Raft) ticker() {
 			}
 
 			if <-voteSucceed {
-				rf.isLeader.Store(true)
+				rf.state.Store(Leader)
 				go rf.broadCastHeartbeat()
 			}
 			fmt.Printf("vote count for candidate %d: %d\n", rf.me, atomic.LoadInt64(&voteCount))
@@ -365,7 +372,7 @@ func (rf *Raft) getPrevLogIndexAndTerm() (int64, int64) {
 
 func (rf *Raft) broadCastHeartbeat() {
 	fmt.Printf("peer %d is broadcasting heartbeat for term %d...\n", rf.me, rf.CurrentTerm.Load())
-	for !rf.killed() && rf.isLeader.Load() {
+	for !rf.killed() && rf.state.Load() == Leader {
 		prevLogIndex, prevLogTerm := rf.getPrevLogIndexAndTerm()
 		for i := range rf.peers {
 			if int64(i) != rf.me {
@@ -382,7 +389,7 @@ func (rf *Raft) broadCastHeartbeat() {
 					if ok {
 						fmt.Printf("peer %d sent heartbeat to peer %d in term %d: %v\n", rf.me, peerIndex, rf.CurrentTerm.Load(), reply)
 						if !reply.Success && reply.Term > rf.CurrentTerm.Load() {
-							rf.isLeader.Store(false)
+							rf.state.Store(Follower)
 							rf.CurrentTerm.Store(reply.Term)
 							fmt.Printf("peer %d is a stale leader, converted to follower and updated to term %d\n", rf.me, rf.CurrentTerm.Load())
 						}
@@ -413,7 +420,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.lastHeard = time.Now()
 	rf.resetElectionTimeout()
-	rf.isLeader.Store(false)
+	rf.state.Store(Follower)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
