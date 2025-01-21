@@ -174,17 +174,23 @@ type RequestVoteReply struct {
 	VoteGranted bool  // true means candidate received vote
 }
 
-// example RequestVote RPC handler.
+// RequestVote RPC handler. Server can only vote for one candiate per term.
+// A vote will be denied when any one of the following condition happens:
+// 1. Candidate's term is smaller than server's current term;
+// 2. Candidate's term is equal to server's current term but the server didn't vote for the candidate;
+// 3. Candidate's log is staler than server's log;
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
-	// 1. Candidate should have higher term
-	// 2. Each term can only vote for one candidate
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if args.Term < rf.CurrentTerm.Load() || (args.Term == rf.CurrentTerm.Load() && args.CandidateId != rf.VotedFor.Load()) {
 		reply.VoteGranted = false
 	} else {
 		reply.VoteGranted = true
 		rf.VotedFor.Store(args.CandidateId)
 		rf.CurrentTerm.Store(args.Term)
+		// when server A doesn't receive heartbeats from leader B due to a network issue of A, A starts an election
+		// and network issue recover. A receive a majority of votes and becomes leader. In this case, B should convert
+		// to follower since A has higher term.
 		rf.state.Store(Follower)
 	}
 	reply.Term = rf.CurrentTerm.Load()
@@ -204,6 +210,8 @@ type AppendEntriesReply struct {
 	Success bool  // true if follower contained entry matching prevLogIndex and prevLogTerm
 }
 
+// when a leader A can't connect to other peers due to network issue and network recovered,
+// but the system has elected a new leader B when A was unavailble.
 func (rf *Raft) AppendEntries(args *AppendEnriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -213,12 +221,18 @@ func (rf *Raft) AppendEntries(args *AppendEnriesArgs, reply *AppendEntriesReply)
 		rf.resetElectionTimeout()
 		rf.lastHeard = time.Now()
 		reply.Success = true
+		rf.CurrentTerm.Store(args.Term)
+		rf.state.Store(Follower)
 	}
 	reply.Term = rf.CurrentTerm.Load()
 }
 
+// resetElectionTimeout resets election timeout
+// Because the tester limits you tens of heartbeats per second, you will have to use an election
+// timeout larger than the paper's 150 to 300 milliseconds, but not too large, because then you
+// may fail to elect a leader within five seconds.
 func (rf *Raft) resetElectionTimeout() {
-	ms := 500 + (rand.Int63() % 800)
+	ms := 500 + (rand.Int63() % 500)
 	rf.electionTimeout = time.Duration(ms) * time.Millisecond
 }
 
@@ -301,23 +315,51 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+// ticker runs as a background go routine to check if this peer needs to
+// start an election periodically until it got killed. When election timeout
+// elapse, an election starts:
+// 1. change its state to candidate;
+// 2. increase current term by 1;
+// 3. vote it self;
+// 4. request votes to all peers via RequestVote RPC;
+// 5. becomes leader and sends heartbeats to peers immediately once receiving marjority of votes;
+// NOTE:
+//  1. this server needs to convert to follower whenever a peer has higher term
+//  2. this server shouldn't serve any RequestVote request during its own election to avoid dead lock.
+//     The dead lock can happen when two or more servers start election at same time. The server
+//     holds the lock during the election, and its RequestVote handler also needs the lock. Two candidates
+//     could wait the RequestVote RPC call from each other and hit dead lock, so I set a timeout for the
+//     election process.
+//
+// Server state flow is in Figure 4
 func (rf *Raft) ticker() {
 	for !rf.killed() {
 		// Your code here (2A)
 		// Check if a leader election should be started.
 		if rf.shouldStartElection() {
+			voteSucceed := make(chan bool)
+			// fail the election when it exceeds one second
+			go func() {
+				time.Sleep(time.Duration(1000) * time.Millisecond)
+				voteSucceed <- false
+			}()
+			rf.mu.Lock()
 			rf.state.Store(Candidate)
 			rf.CurrentTerm.Add(1)
 			fmt.Printf("peer %d starts an election for term %d...\n", rf.me, rf.CurrentTerm.Load())
 
-			voteCount := int64(1)
+			// store the current term and check it after the election to ensure that
+			// the term is not changed during the election
+			termCheck := rf.CurrentTerm.Load()
 
+			voteCount := int64(1)
 			rf.VotedFor.Store(rf.me)
-			voteSucceed := make(chan bool)
 
 			prevLogIndex, prevLogTerm := rf.getPrevLogIndexAndTerm()
 			for i := range rf.peers {
 				if int64(i) != rf.me {
+					// parallelize RPC call to optimize the performance and the server can
+					// become leader immediately once it receives a majority of votes
 					go func(peerIndex int) {
 						args := RequestVoteArgs{
 							Term:         rf.CurrentTerm.Load(),
@@ -348,11 +390,12 @@ func (rf *Raft) ticker() {
 				}
 			}
 
-			if <-voteSucceed {
+			if <-voteSucceed && termCheck == rf.CurrentTerm.Load() {
 				rf.state.Store(Leader)
 				go rf.broadCastHeartbeat()
 			}
 			fmt.Printf("vote count for candidate %d: %d\n", rf.me, atomic.LoadInt64(&voteCount))
+			rf.mu.Unlock()
 		}
 
 		// pause for a random amount of time between 50 and 350
