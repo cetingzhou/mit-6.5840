@@ -361,6 +361,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 					fmt.Printf("Appending: {leader: %d, peer: %d, entry: %v}\n", rf.me, peerIndex, entry)
 					for !rf.killed() {
 						// leader needs to send all entries from the receiver's nextIndex to this new entry
+						rf.mu.Lock()
 						ni := rf.nextIndex[peerIndex]
 						prevLogIndex, prevLogTerm := ni-1, int64(-1)
 						if prevLogIndex >= 0 {
@@ -374,6 +375,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 							Entries:           rf.LogEntries[ni:],
 							LeaderCommitIndex: rf.commitIndex.Load(),
 						}
+						rf.mu.Unlock()
 						reply := AppendEntriesReply{}
 						ok := rf.peers[peerIndex].Call("Raft.AppendEntries", &args, &reply)
 						if ok {
@@ -381,9 +383,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 							if reply.Success {
 								fmt.Println("AppendEntries succeeded!")
 								// update nextIndex and matchIndex for follower
+								rf.mu.Lock()
 								rf.nextIndex[peerIndex] = int64(len(rf.LogEntries))
 								rf.matchIndex[peerIndex] = int64(len(rf.LogEntries) - 1)
 								countReplica.Add(1)
+								rf.mu.Unlock()
 								if countReplica.Load() > int64(len(rf.peers)/2) {
 									replicateSucceed <- true
 								}
