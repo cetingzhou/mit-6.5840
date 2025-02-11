@@ -71,9 +71,9 @@ type Raft struct {
 
 	// Volatile state on all servers
 	// index of highest log entry known to be committed (initialized to 0, increases monotonically
-	commitIndex int64
+	commitIndex atomic.Int64
 	// index of highest log entry applied to state machine (initialized to 0, increases monotonically)
-	lastApplied int64
+	lastApplied atomic.Int64
 
 	// Volatile state on leaders
 	// for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
@@ -227,7 +227,7 @@ func (rf *Raft) AppendEntries(args *AppendEnriesArgs, reply *AppendEntriesReply)
 	if args.Term < rf.CurrentTerm.Load() {
 		fmt.Printf("Peer %d has higher term than current leader %d: %d > %d\n", rf.me, args.LeaderId, rf.CurrentTerm.Load(), args.Term)
 		reply.Success = false
-	} else if args.PrevLogIndex > lastIndex {
+	} else if lastIndex >= 0 && args.PrevLogIndex > lastIndex {
 		fmt.Printf("Peer %d is inconsistent with leader %d: peer.lastIndex is %d, but leader.PrevLogIndex is %d\n", rf.me, args.LeaderId, lastIndex, args.PrevLogIndex)
 		reply.Success = false
 	} else {
@@ -247,17 +247,17 @@ func (rf *Raft) AppendEntries(args *AppendEnriesArgs, reply *AppendEntriesReply)
 	}
 	// all successful AppendEntries should commit entries if there is any log that is not committed
 	if reply.Success {
-		for i := rf.commitIndex + 1; i <= args.LeaderCommitIndex; i++ {
+		for i := rf.commitIndex.Load() + 1; i <= args.LeaderCommitIndex; i++ {
 			msg := ApplyMsg{
 				CommandValid: true,
 				Command:      rf.LogEntries[i].Command,
 				CommandIndex: int(i) + 1, // test start with 1 but we start with 0
 			}
-			rf.commitIndex++
-			rf.lastApplied++
-			fmt.Printf("Peer %d is committing msg: %v, peer.commitIndex: %d, peer.lastApplied: %d\n", rf.me, msg, rf.commitIndex, rf.lastApplied)
+			rf.commitIndex.Add(1)
+			rf.lastApplied.Add(1)
+			fmt.Printf("Peer %d is committing msg: %v, peer.commitIndex: %d, peer.lastApplied: %d\n", rf.me, msg, rf.commitIndex.Load(), rf.lastApplied.Load())
 			rf.applyCh <- msg
-			fmt.Printf("Peer %d committed msg: %v, peer.commitIndex: %d, peer.lastApplied: %d\n", rf.me, msg, rf.commitIndex, rf.lastApplied)
+			fmt.Printf("Peer %d committed msg: %v, peer.commitIndex: %d, peer.lastApplied: %d\n", rf.me, msg, rf.commitIndex.Load(), rf.lastApplied.Load())
 		}
 		rf.CurrentTerm.Store(args.Term)
 		rf.state.Store(Follower)
@@ -265,6 +265,7 @@ func (rf *Raft) AppendEntries(args *AppendEnriesArgs, reply *AppendEntriesReply)
 	rf.resetElectionTimeout()
 	rf.lastHeard = time.Now()
 	reply.Term = rf.CurrentTerm.Load()
+	fmt.Printf("Peer %d finished AppendEntries: %v\n", rf.me, args)
 }
 
 // resetElectionTimeout resets election timeout
@@ -350,7 +351,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		var countReplica atomic.Int64
 		replicateSucceed := make(chan bool)
 		rf.mu.Lock()
-		prevLogIndex, prevLogTerm := rf.getPrevLogIndexAndTerm()
 		entry := Entry{command, rf.CurrentTerm.Load()}
 		rf.LogEntries = append(rf.LogEntries, entry)
 		countReplica.Add(1)
@@ -362,18 +362,22 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 					for !rf.killed() {
 						// leader needs to send all entries from the receiver's nextIndex to this new entry
 						ni := rf.nextIndex[peerIndex]
+						prevLogIndex, prevLogTerm := ni-1, int64(-1)
+						if prevLogIndex >= 0 {
+							prevLogTerm = rf.LogEntries[prevLogIndex].Term
+						}
 						args := AppendEnriesArgs{
 							Term:              rf.CurrentTerm.Load(),
 							LeaderId:          rf.me,
 							PrevLogIndex:      prevLogIndex,
 							PrevLogTerm:       prevLogTerm,
 							Entries:           rf.LogEntries[ni:],
-							LeaderCommitIndex: rf.commitIndex,
+							LeaderCommitIndex: rf.commitIndex.Load(),
 						}
 						reply := AppendEntriesReply{}
 						ok := rf.peers[peerIndex].Call("Raft.AppendEntries", &args, &reply)
 						if ok {
-							fmt.Printf("AppendEntriesReply: %v\n", reply)
+							fmt.Printf("Leader %d received AppendEntriesReply from peer %d: %v\n", rf.me, peerIndex, reply)
 							if reply.Success {
 								fmt.Println("AppendEntries succeeded!")
 								// update nextIndex and matchIndex for follower
@@ -393,7 +397,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 									break
 								} else {
 									// handle inconsistency: decrement nextIndex and retry
-									fmt.Printf("Found inconsistent logs: {prevLogIndex: %d, prevLogTerm: %d, nextIndex: %d, reply.Term: %d}", prevLogIndex, prevLogTerm, ni, reply.Term)
+									fmt.Printf("Found inconsistent logs: {prevLogIndex: %d, prevLogTerm: %d, nextIndex: %d, reply.Term: %d}\n", prevLogIndex, prevLogTerm, ni, reply.Term)
 									rf.nextIndex[peerIndex]--
 								}
 							}
@@ -407,17 +411,20 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		if <-replicateSucceed {
 			fmt.Printf("Agreement achieved: {index: %d, term: %d, isLeader: %v, entry: %v}\n", index, term, isLeader, entry)
 			// commit
-			for i := int(rf.commitIndex) + 1; i < len(rf.LogEntries); i++ {
+			rf.mu.Lock()
+			l := len(rf.LogEntries)
+			rf.mu.Unlock()
+			for i := int(rf.commitIndex.Load()) + 1; i < l; i++ {
 				msg := ApplyMsg{
 					CommandValid: true,
 					Command:      rf.LogEntries[i].Command,
 					CommandIndex: i + 1, // test start with 1 but we start with 0
 				}
-				rf.commitIndex++
-				rf.lastApplied++
-				fmt.Printf("Leader %d is committing msg: %v, leader.commitIndex: %d, leader.lastApplied: %d\n", rf.me, msg, rf.commitIndex, rf.lastApplied)
+				rf.commitIndex.Add(1)
+				rf.lastApplied.Add(1)
+				fmt.Printf("Leader %d is committing msg: %v, leader.commitIndex: %d, leader.lastApplied: %d\n", rf.me, msg, rf.commitIndex.Load(), rf.lastApplied.Load())
 				rf.applyCh <- msg
-				fmt.Printf("Leader %d committed msg: %v, leader.commitIndex: %d, leader.lastApplied: %d\n", rf.me, msg, rf.commitIndex, rf.lastApplied)
+				fmt.Printf("Leader %d committed msg: %v, leader.commitIndex: %d, leader.lastApplied: %d\n", rf.me, msg, rf.commitIndex.Load(), rf.lastApplied.Load())
 			}
 		}
 	}()
@@ -563,7 +570,7 @@ func (rf *Raft) broadCastHeartbeat() {
 						PrevLogIndex:      prevLogIndex,
 						PrevLogTerm:       prevLogTerm,
 						Entries:           nil,
-						LeaderCommitIndex: rf.commitIndex,
+						LeaderCommitIndex: rf.commitIndex.Load(),
 					}
 					reply := AppendEntriesReply{}
 					ok := rf.peers[peerIndex].Call("Raft.AppendEntries", &args, &reply)
@@ -600,8 +607,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.LogEntries = make([]Entry, 0, 100)
 	rf.nextIndex = make([]int64, len(rf.peers))
 	rf.matchIndex = make([]int64, len(rf.peers))
-	rf.commitIndex = -1
-	rf.lastApplied = -1
+	rf.commitIndex.Store(-1)
+	rf.lastApplied.Store(-1)
 	rf.applyCh = applyCh
 
 	// Your initialization code here (2A, 2B, 2C).
